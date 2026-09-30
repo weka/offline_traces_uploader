@@ -1,4 +1,4 @@
-// wekatrace — collect WEKA trace shards from a cluster and (optionally)
+// offline_traces_uploader (formerly wekatrace) — collect WEKA trace shards from a cluster and (optionally)
 // upload them to a WEKA-provided drop URL for offline analysis.
 //
 // Run on ONE backend of the cluster, as root (sudo). Host discovery and the
@@ -218,7 +218,7 @@ func collectMetadata(metaDir string, o opts, from, to time.Time) {
 	writeCmdOutput(filepath.Join(metaDir, "cluster-process.json"), "weka", "cluster", "process", "-J")
 	writeCmdOutput(filepath.Join(metaDir, "traces-status.txt"), "weka", "debug", "traces", "status")
 	writeCmdOutput(filepath.Join(metaDir, "traces-freeze.txt"), "weka", "debug", "traces", "freeze", "show")
-	win := fmt.Sprintf("start=%s\nend=%s\nmargin_min=%d\nfrom_epoch=%d\nto_epoch=%d\ncollected_at=%s\nwekatrace_version=%s\n",
+	win := fmt.Sprintf("start=%s\nend=%s\nmargin_min=%d\nfrom_epoch=%d\nto_epoch=%d\ncollected_at=%s\noffline_traces_uploader_version=%s\n",
 		o.start, o.end, o.marginMin, from.Unix(), to.Unix(), time.Now().UTC().Format(time.RFC3339), version)
 	os.WriteFile(filepath.Join(metaDir, "window.txt"), []byte(win), 0644)
 }
@@ -349,7 +349,7 @@ func main() {
 	flag.Parse()
 
 	if o.printVersion {
-		fmt.Println("wekatrace", version)
+		fmt.Println("offline_traces_uploader", version)
 		return
 	}
 	if _, err := exec.LookPath("weka"); err != nil {
@@ -435,7 +435,7 @@ func main() {
 			"--start-time", from.UTC().Format("2006-01-02 15:04:05")+"Z",
 			"--end-time", to.UTC().Format("2006-01-02 15:04:05")+"Z",
 			"--retention", fmt.Sprintf("%dd", o.freezeDays),
-			"--comment", fmt.Sprintf("wekatrace %s", time.Now().UTC().Format(time.RFC3339)))
+			"--comment", fmt.Sprintf("offline_traces_uploader %s", time.Now().UTC().Format(time.RFC3339)))
 		if err != nil {
 			logf("WARNING: freeze failed (not logged in?) — continuing WITHOUT freeze; retention may rotate shards away mid-copy")
 			time.Sleep(5 * time.Second)
