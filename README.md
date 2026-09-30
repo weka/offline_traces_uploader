@@ -13,7 +13,7 @@ only deposit files.
 
 ```bash
 # download a prebuilt binary (or build from source: go build .)
-curl -fsSLo wekatrace https://objectstorage.eu-frankfurt-1.oraclecloud.com/n/fr3hx7l7h3p9/b/chaos-lab/o/wekatrace-linux-amd64
+curl -fsSLo wekatrace https://github.com/weka/wekatrace/releases/latest/download/wekatrace-linux-amd64
 chmod +x wekatrace
 
 # incident window already frozen? (weka debug traces freeze show)
