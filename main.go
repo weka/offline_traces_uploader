@@ -290,6 +290,62 @@ func copyShippedElfCaches(dstDir string) int {
 	return 0
 }
 
+var errFreezeExists = fmt.Errorf("a freeze period is already set")
+
+func setFreeze(from, to time.Time, days int) error {
+	_, err := weka("debug", "traces", "freeze", "set",
+		"--start-time", from.UTC().Format("2006-01-02 15:04:05")+"Z",
+		"--end-time", to.UTC().Format("2006-01-02 15:04:05")+"Z",
+		"--retention", fmt.Sprintf("%dd", days),
+		"--comment", fmt.Sprintf("offline_traces_uploader %s", time.Now().UTC().Format(time.RFC3339)))
+	if err == nil {
+		return nil
+	}
+	detail := ""
+	if ee, ok := err.(*exec.ExitError); ok {
+		detail = strings.TrimSpace(string(ee.Stderr))
+	}
+	if strings.Contains(detail, "already set") {
+		return errFreezeExists
+	}
+	return fmt.Errorf("%v: %s", err, detail)
+}
+
+// loginInteractively prompts for WEKA cluster credentials on the controlling
+// terminal (password without echo) and runs `weka user login`. Returns true
+// on a successful login; false when there is no terminal or login failed.
+func loginInteractively() bool {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false // no terminal (cron/CI) — keep the old warning path
+	}
+	defer tty.Close()
+	fmt.Fprint(tty, "\nWEKA CLI is not logged in — freeze needs ClusterAdmin.\n")
+	fmt.Fprint(tty, "WEKA username [admin]: ")
+	rd := make([]byte, 256)
+	n, _ := tty.Read(rd)
+	user := strings.TrimSpace(string(rd[:n]))
+	if user == "" {
+		user = "admin"
+	}
+	fmt.Fprint(tty, "WEKA password: ")
+	// no-echo via stty on the same tty; restored right after the read
+	exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
+	n, _ = tty.Read(rd)
+	exec.Command("stty", "-F", "/dev/tty", "echo").Run()
+	fmt.Fprintln(tty)
+	pass := strings.TrimSpace(string(rd[:n]))
+	if pass == "" {
+		return false
+	}
+	if out, err := weka("user", "login", user, pass); err != nil {
+		logf("weka login failed: %v %s", err, out)
+		return false
+	}
+	logf("logged in as %s", user)
+	return true
+}
+
 func clusterName() string {
 	out, err := weka("status", "-J")
 	if err != nil {
@@ -474,13 +530,29 @@ func main() {
 
 	if !o.noFreeze {
 		logf("freezing trace window cluster-wide (retention %dd) — needs weka login", o.freezeDays)
-		_, err := weka("debug", "traces", "freeze", "set",
-			"--start-time", from.UTC().Format("2006-01-02 15:04:05")+"Z",
-			"--end-time", to.UTC().Format("2006-01-02 15:04:05")+"Z",
-			"--retention", fmt.Sprintf("%dd", o.freezeDays),
-			"--comment", fmt.Sprintf("offline_traces_uploader %s", time.Now().UTC().Format(time.RFC3339)))
-		if err != nil {
-			logf("WARNING: freeze failed (not logged in?) — continuing WITHOUT freeze; retention may rotate shards away mid-copy")
+		err := setFreeze(from, to, o.freezeDays)
+		if err != nil && err != errFreezeExists {
+			// Most likely cause: no WEKA CLI login. When a human is at the
+			// terminal, ask for the cluster credentials and retry once.
+			if loginInteractively() {
+				err = setFreeze(from, to, o.freezeDays)
+			}
+		}
+		switch {
+		case err == nil:
+		case err == errFreezeExists:
+			// Never override an existing freeze automatically — on a customer
+			// cluster it may be WEKA support's. Say so and carry on.
+			if fs, fe, ferr := freezeWindow(); ferr == nil {
+				logf("NOTE: a freeze already exists (%s .. %s) and was left untouched.",
+					fs.UTC().Format("2006-01-02 15:04"), fe.UTC().Format("2006-01-02 15:04"))
+				logf("      Your window is only protected where it overlaps it. To collect the")
+				logf("      frozen window instead, rerun with -from-freeze.")
+			} else {
+				logf("NOTE: a freeze already exists and was left untouched (rerun with -from-freeze to collect it).")
+			}
+		default:
+			logf("WARNING: freeze failed (%v) — continuing WITHOUT freeze; retention may rotate shards away mid-copy", err)
 			time.Sleep(5 * time.Second)
 		}
 	}
