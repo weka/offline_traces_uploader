@@ -20,7 +20,7 @@ chmod +x offline_traces_uploader
 sudo ./offline_traces_uploader -from-freeze -customer '<your-company>' -upload '<upload-code-from-weka>'
 
 # otherwise pick the window yourself
-sudo ./offline_traces_uploader -start '2026-09-30 14:00' -end '2026-09-30 14:30' \
+sudo ./offline_traces_uploader -last 60m \
      -customer '<your-company>' -upload '<upload-code-from-weka>'
 
 # size check first — copies nothing

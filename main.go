@@ -36,6 +36,11 @@ import (
 
 var version = "dev" // stamped at build time via -ldflags "-X main.version=..."
 
+// Selection: window shards by mtime, every ELF cache, dumper configs, and —
+// so a missed window still yields something readable per stream — the newest
+// shard of every <util>_slot<N>_<area>_<container> group (shard names end in
+// _<seq>_<seq>_<timestamp>.shard; ls -1t + first-seen-per-prefix keeps the
+// newest of each).
 const selectScript = `
 FROM_EPOCH="$1"; TO_EPOCH="$2"
 for d in /opt/weka/traces /opt/weka/wtracer/traces; do
@@ -44,7 +49,10 @@ for d in /opt/weka/traces /opt/weka/wtracer/traces; do
        -newermt "@$FROM_EPOCH" ! -newermt "@$TO_EPOCH" 2>/dev/null
   find "$d" -maxdepth 1 -type f -name '*cache*' 2>/dev/null
   find "$d" -maxdepth 2 -type f -name 'config.json' 2>/dev/null
-  ls -1t "$d"/*.shard 2>/dev/null | head -1
+  ls -1t "$d"/*.shard 2>/dev/null | awk '{
+    p=$0; sub(/_[0-9]+_[0-9]+_[^_\/]*\.shard$/,"",p);
+    if (!(p in seen)) { seen[p]=1; print }
+  }'
 done | sort -u
 `
 
@@ -58,6 +66,7 @@ var sshArgs = []string{
 
 type opts struct {
 	start, end   string
+	last         string
 	fromFreeze   bool
 	estimate     bool
 	dest         string
@@ -356,8 +365,9 @@ func upload(o opts, tarPath, cluster string) error {
 
 func main() {
 	var o opts
-	flag.StringVar(&o.start, "start", "", "window start (any 'date -d' parsable string); required unless -from-freeze")
+	flag.StringVar(&o.start, "start", "", "window start (any 'date -d' parsable string); required unless -from-freeze/-last")
 	flag.StringVar(&o.end, "end", "", "window end (default: now)")
+	flag.StringVar(&o.last, "last", "", "collect the last N of traces ending now, e.g. -last 60m or -last 2h (replaces -start/-end)")
 	flag.BoolVar(&o.fromFreeze, "from-freeze", false, "use the existing freeze period as the window (sets nothing)")
 	flag.BoolVar(&o.estimate, "estimate", false, "print per-host sizes and exit; nothing is copied")
 	flag.StringVar(&o.dest, "dest", "/tmp", "output directory (peak usage ~2x the estimate)")
@@ -398,6 +408,17 @@ func main() {
 	var startT, endT time.Time
 	var err error
 	switch {
+	case o.last != "":
+		if o.start != "" || o.end != "" || o.fromFreeze {
+			die("-last replaces -start/-end/-from-freeze")
+		}
+		d, derr := time.ParseDuration(o.last)
+		if derr != nil || d <= 0 {
+			die("cannot parse -last %q (use e.g. 60m, 2h, 90m)", o.last)
+		}
+		endT = time.Now()
+		startT = endT.Add(-d)
+		logf("using the last %s (ending now)", d)
 	case o.fromFreeze:
 		if o.start != "" || o.end != "" {
 			die("-from-freeze replaces -start/-end")
@@ -420,7 +441,7 @@ func main() {
 			endT = time.Now()
 		}
 	default:
-		die("-start is required (or -from-freeze); see -h")
+		die("-start is required (or -from-freeze / -last 60m); see -h")
 	}
 	if !endT.After(startT) {
 		die("-end must be after -start")
