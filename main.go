@@ -129,9 +129,31 @@ func discoverHosts(o opts) []string {
 		}
 		return hs
 	}
-	out, err := weka("debug", "pdsh", "--drives", "--print-hosts")
+	// `weka debug pdsh` resolves hosts from the cluster config. On a cluster
+	// that only just formed (containers still applying resources) the config
+	// dump fails transiently, so retry before giving up — and surface the
+	// CLI's own stderr, which names the real problem.
+	var out string
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		out, err = weka("debug", "pdsh", "--drives", "--print-hosts")
+		if err == nil {
+			break
+		}
+		if attempt < 3 {
+			logf("host discovery attempt %d failed, retrying in 10s...", attempt)
+			time.Sleep(10 * time.Second)
+		}
+	}
 	if err != nil {
-		die("host discovery failed (%v) — try --hosts", err)
+		detail := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			detail = strings.TrimSpace(string(ee.Stderr))
+		}
+		die("host discovery failed: %v %s\n"+
+			"  - is WEKA up on this host? (weka local ps)\n"+
+			"  - a just-formed cluster can take a few minutes before this works\n"+
+			"  - or pass the backends yourself: -hosts host1,host2,...", err, detail)
 	}
 	seen := map[string]bool{}
 	var hs []string
