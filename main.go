@@ -19,6 +19,7 @@
 package main
 
 import (
+	"archive/tar"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,11 +27,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -211,27 +212,98 @@ func remoteDu(host string, files []string) int64 {
 	return n
 }
 
-// remoteTar streams `sudo tar` of the file list on host into dst.
-// tar exit code 1 ("file changed as we read it", the open shard) is expected.
-func remoteTar(host string, files []string, dst string) error {
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+// streamHostIntoTar pulls `sudo tar` of the file list from host and re-emits
+// every entry into the final tar under hosts/<host>/, renamed from its
+// absolute origin. The remote tar stream frames each file's size, so nothing
+// is staged on disk — the final tarball is the only copy ("tar while
+// saving"; a 2026-10 field run filled a small /tmp with the old two-phase
+// layout's double footprint). Remote tar exit 1 ("file changed as we read
+// it", the open shard; GNU pads the entry to its header size) is expected.
+func streamHostIntoTar(tw *tar.Writer, prefix, host string, files []string) (nfiles int, bytes int64, err error) {
 	args := append(append([]string{}, sshArgs...), host,
 		"sudo tar -cf - --absolute-names --warning=no-file-changed -T -")
 	cmd := exec.Command("ssh", args...)
 	cmd.Stdin = strings.NewReader(strings.Join(files, "\n") + "\n")
-	cmd.Stdout = f
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return nil // open shard changed mid-read — fine
-		}
-		return fmt.Errorf("streaming tar from %s: %v", host, err)
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, 0, err
 	}
-	return nil
+	if err := cmd.Start(); err != nil {
+		return 0, 0, err
+	}
+	tr := tar.NewReader(pipe)
+	for {
+		hdr, rerr := tr.Next()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return nfiles, bytes, fmt.Errorf("reading tar stream from %s: %v", host, rerr)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		name := strings.TrimPrefix(hdr.Name, "/")
+		switch {
+		case strings.HasPrefix(name, "opt/weka/wtracer/traces/"):
+			name = "wtracer/" + strings.TrimPrefix(name, "opt/weka/wtracer/traces/")
+		case strings.HasPrefix(name, "opt/weka/traces/"):
+			name = "traces/" + strings.TrimPrefix(name, "opt/weka/traces/")
+		default:
+			name = "other/" + path.Base(name)
+		}
+		hdr.Name = prefix + "hosts/" + host + "/" + name
+		if werr := tw.WriteHeader(hdr); werr != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return nfiles, bytes, werr
+		}
+		n, werr := io.Copy(tw, tr)
+		bytes += n
+		if werr != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return nfiles, bytes, fmt.Errorf("writing %s: %v", hdr.Name, werr)
+		}
+		nfiles++
+	}
+	if err := cmd.Wait(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return nfiles, bytes, nil // open shard changed mid-read — fine
+		}
+		return nfiles, bytes, fmt.Errorf("remote tar on %s: %v", host, err)
+	}
+	return nfiles, bytes, nil
+}
+
+// addFileToTar copies one local file into the tar at the given entry name.
+func addFileToTar(tw *tar.Writer, localPath, name string) error {
+	fi, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: fi.Size(), ModTime: fi.ModTime()}); err != nil {
+		return err
+	}
+	_, err = io.Copy(tw, f)
+	return err
+}
+
+// addBytesToTar writes an in-memory blob as a tar entry.
+func addBytesToTar(tw *tar.Writer, b []byte, name string) error {
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(b)), ModTime: time.Now()}); err != nil {
+		return err
+	}
+	_, err := tw.Write(b)
+	return err
 }
 
 func writeCmdOutput(path string, name string, args ...string) {
@@ -559,67 +631,74 @@ func main() {
 
 	cluster := clusterName()
 	stamp := time.Now().Format("20060102-150405")
-	work := filepath.Join(o.dest, fmt.Sprintf("weka-traces-%s-%s", cluster, stamp))
-	for _, d := range []string{"meta", "hosts", "elf_cache"} {
-		if err := os.MkdirAll(filepath.Join(work, d), 0755); err != nil {
-			die("cannot create %s: %v", work, err)
+	prefix := fmt.Sprintf("weka-traces-%s-%s/", cluster, stamp)
+	out := filepath.Join(o.dest, fmt.Sprintf("weka-traces-%s-%s.tar", cluster, stamp))
+
+	// Everything streams straight into the final tarball — no work dir, so
+	// peak disk usage is the tarball itself (field lesson: the old two-phase
+	// layout needed double the space and filled a small /tmp). Only the tiny
+	// metadata + ELF caches (~55MB) touch a staging dir, briefly.
+	stage, err := os.MkdirTemp(o.dest, ".traces-stage-*")
+	if err != nil {
+		die("cannot create staging dir in %s: %v", o.dest, err)
+	}
+	defer os.RemoveAll(stage)
+
+	f, err := os.Create(out)
+	if err != nil {
+		die("cannot create %s: %v", out, err)
+	}
+	tw := tar.NewWriter(f)
+
+	logf("collecting cluster metadata")
+	metaDir := filepath.Join(stage, "meta")
+	elfDir := filepath.Join(stage, "elf_cache")
+	os.MkdirAll(metaDir, 0755)
+	os.MkdirAll(elfDir, 0755)
+	collectMetadata(metaDir, o, from, to)
+	logf("shipped elf caches: %d files", copyShippedElfCaches(elfDir))
+	for _, d := range []string{"meta", "elf_cache"} {
+		entries, _ := os.ReadDir(filepath.Join(stage, d))
+		for _, e := range entries {
+			if err := addFileToTar(tw, filepath.Join(stage, d, e.Name()), prefix+d+"/"+e.Name()); err != nil {
+				die("writing %s into the tarball: %v", e.Name(), err)
+			}
 		}
 	}
 
-	logf("collecting cluster metadata")
-	collectMetadata(filepath.Join(work, "meta"), o, from, to)
-	logf("shipped elf caches: %d files", copyShippedElfCaches(filepath.Join(work, "elf_cache")))
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	// Hosts stream one after another: a single tar stream can only grow at
+	// one end, and one intra-cluster ssh stream is plenty fast.
 	failed := false
 	for _, h := range hosts {
-		wg.Add(1)
-		go func(h string) {
-			defer wg.Done()
-			hdir := filepath.Join(work, "hosts", h)
-			os.MkdirAll(hdir, 0755)
-			files, err := remoteFilelist(h, from.Unix(), to.Unix())
-			if err != nil {
-				logf("[%s] FAILED: %v", h, err)
-				mu.Lock()
-				failed = true
-				mu.Unlock()
-				return
-			}
-			os.WriteFile(filepath.Join(hdir, "filelist.txt"), []byte(strings.Join(files, "\n")+"\n"), 0644)
-			if len(files) == 0 {
-				logf("[%s] WARNING: no shards matched the window", h)
-			}
-			dst := filepath.Join(hdir, "traces.tar")
-			if err := remoteTar(h, files, dst); err != nil {
-				logf("[%s] FAILED: %v", h, err)
-				mu.Lock()
-				failed = true
-				mu.Unlock()
-				return
-			}
-			fi, _ := os.Stat(dst)
-			var sz int64
-			if fi != nil {
-				sz = fi.Size()
-			}
-			logf("[%s] %d files, %s", h, len(files), humanBytes(sz))
-		}(h)
+		files, err := remoteFilelist(h, from.Unix(), to.Unix())
+		if err != nil {
+			logf("[%s] FAILED: %v", h, err)
+			failed = true
+			continue
+		}
+		if len(files) == 0 {
+			logf("[%s] WARNING: no shards matched the window", h)
+		}
+		addBytesToTar(tw, []byte(strings.Join(files, "\n")+"\n"), prefix+"hosts/"+h+"/filelist.txt")
+		logf("[%s] streaming %d files...", h, len(files))
+		n, sz, err := streamHostIntoTar(tw, prefix, h, files)
+		if err != nil {
+			logf("[%s] FAILED mid-stream (%d files, %s in): %v", h, n, humanBytes(sz), err)
+			failed = true
+			continue
+		}
+		logf("[%s] %d files, %s", h, n, humanBytes(sz))
 	}
-	wg.Wait()
 	if failed {
 		logf("WARNING: one or more hosts failed — check output above")
 	}
 
-	out := filepath.Join(o.dest, fmt.Sprintf("weka-traces-%s-%s.tar", cluster, stamp))
-	logf("packing %s", out)
-	cmd := exec.Command("tar", "-C", o.dest, "-cf", out, filepath.Base(work))
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		die("packing failed: %v", err)
+	if err := tw.Close(); err != nil {
+		die("finalizing tarball: %v", err)
 	}
-	os.RemoveAll(work)
+	if err := f.Close(); err != nil {
+		die("closing tarball: %v", err)
+	}
 	fi, _ := os.Stat(out)
 	logf("DONE: %s (%s)", out, humanBytes(fi.Size()))
 
