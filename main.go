@@ -297,6 +297,34 @@ func addFileToTar(tw *tar.Writer, localPath, name string) error {
 	return err
 }
 
+// verifyTarEnd checks the archive's end-of-archive marker (two 512-byte zero
+// blocks). A transfer cut mid-stream leaves a tarball that lists fine until
+// the cut — this catches it at the source, where the size is still knowable.
+func verifyTarEnd(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() < 1024 {
+		return fmt.Errorf("file too small to be a tar archive")
+	}
+	buf := make([]byte, 1024)
+	if _, err := f.ReadAt(buf, fi.Size()-1024); err != nil {
+		return err
+	}
+	for _, b := range buf {
+		if b != 0 {
+			return fmt.Errorf("missing end-of-archive blocks (truncated?)")
+		}
+	}
+	return nil
+}
+
 // addBytesToTar writes an in-memory blob as a tar entry.
 func addBytesToTar(tw *tar.Writer, b []byte, name string) error {
 	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(b)), ModTime: time.Now()}); err != nil {
@@ -700,7 +728,12 @@ func main() {
 		die("closing tarball: %v", err)
 	}
 	fi, _ := os.Stat(out)
-	logf("DONE: %s (%s)", out, humanBytes(fi.Size()))
+	if err := verifyTarEnd(out); err != nil {
+		die("the tarball failed its end-of-archive check (%v) — do not ship it", err)
+	}
+	logf("DONE: %s (%s, %d bytes)", out, humanBytes(fi.Size()), fi.Size())
+	logf("verified: archive ends cleanly. CONFIRM THE BYTE COUNT after every copy hop —")
+	logf("a cut transfer leaves a tarball that looks fine until extraction (field lesson).")
 
 	if o.uploadURL != "" {
 		if err := upload(o, out, cluster); err != nil {
