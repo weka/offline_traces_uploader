@@ -8,11 +8,17 @@
 // authorized_keys map to — usually NOT root — so every remote command runs
 // under its own sudo.
 //
-// What lands in the tarball, per host: trace shards covering the requested
-// window, the ELF caches lying in the trace dirs, and the dumper config.json
-// files. Once per run: the shipped ELF caches from the running container
-// image (decode-critical, ~55MB) and cluster metadata (version, status,
-// container/process maps, traces + freeze state, window record).
+// Two modes:
+//
+//	-upload (connected cluster): every host streams straight into its own
+//	object in WEKA's bucket (<customer>/<stamp>_<cluster>/hosts/<host>.tar),
+//	a few hosts at a time, as multipart uploads. Nothing touches the local
+//	disk, there is no size cap, a silent host is dropped after -stall instead
+//	of freezing the run, and a live progress.json lets WEKA watch the run.
+//
+//	no -upload (dark site): one tarball in -dest, after checking it fits and
+//	is not on a WEKA filesystem. Carry it out and push it with -upload-file
+//	(any Linux box with internet) or the dialog's "Upload from local".
 //
 // The upload URL is a write-only, expiring token handed out by WEKA per
 // engagement. It can only PUT objects — it cannot list or read anything.
@@ -20,50 +26,26 @@ package main
 
 import (
 	"archive/tar"
-	"encoding/json"
+	"bytes"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
-	"path"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 var version = "dev" // stamped at build time via -ldflags "-X main.version=..."
-
-// Selection: window shards by mtime, every ELF cache, dumper configs, and —
-// so a missed window still yields something readable per stream — the newest
-// shard of every <util>_slot<N>_<area>_<container> group (shard names end in
-// _<seq>_<seq>_<timestamp>.shard; ls -1t + first-seen-per-prefix keeps the
-// newest of each).
-const selectScript = `
-FROM_EPOCH="$1"; TO_EPOCH="$2"
-for d in /opt/weka/traces /opt/weka/wtracer/traces; do
-  [ -d "$d" ] || continue
-  find "$d" -maxdepth 1 -type f -name '*.shard' \
-       -newermt "@$FROM_EPOCH" ! -newermt "@$TO_EPOCH" 2>/dev/null
-  find "$d" -maxdepth 1 -type f -name '*cache*' 2>/dev/null
-  find "$d" -maxdepth 2 -type f -name 'config.json' 2>/dev/null
-  ls -1t "$d"/*.shard 2>/dev/null | awk '{
-    p=$0; sub(/_[0-9]+_[0-9]+_[^_\/]*\.shard$/,"",p);
-    if (!(p in seen)) { seen[p]=1; print }
-  }'
-done | sort -u
-`
-
-// sshArgs mirrors what `weka debug pdsh --dry-run` shows the CLI itself using.
-var sshArgs = []string{
-	"-o", "LogLevel=ERROR",
-	"-o", "UserKnownHostsFile=/dev/null",
-	"-o", "StrictHostKeyChecking=no",
-	"-o", "ConnectTimeout=15",
-}
 
 type opts struct {
 	start, end   string
@@ -77,446 +59,52 @@ type opts struct {
 	freezeDays   int
 	uploadURL    string
 	customer     string
-	keepWorkdir  bool
 	printVersion bool
+	parallel     int
+	inflight     int
+	partMiB      int
+	stall        time.Duration
+	drop         string
+	uploadFile   string
 }
 
 func logf(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
+	line := fmt.Sprintf(format, a...)
+	ts := time.Now().Format("15:04:05")
+	fmt.Fprintf(os.Stderr, "[%s] %s\n", ts, line)
+	remember("[" + ts + "] " + line)
 }
 
 func die(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "ERROR: %s\n", fmt.Sprintf(format, a...))
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintf(os.Stderr, "ERROR: %s\n", msg)
+	remember("ERROR: " + msg)
+	if prog != nil {
+		prog.finish("failed", firstLine(msg))
+	}
 	os.Exit(1)
 }
 
-func run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
-	return strings.TrimSpace(string(out)), err
-}
+var dropNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// weka runs the weka CLI, returning stdout.
-func weka(args ...string) (string, error) { return run("weka", args...) }
-
-func parseTime(s string) (time.Time, error) {
-	// Accept what `date -d` would: lean on date(1) so operators can use the
-	// same strings they are used to ("2026-09-29 14:00", "45 minutes ago", ISO).
-	out, err := run("date", "-d", s, "+%s")
-	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot parse time %q", s)
-	}
-	var epoch int64
-	fmt.Sscanf(out, "%d", &epoch)
-	return time.Unix(epoch, 0), nil
-}
-
-func freezeWindow() (start, end time.Time, err error) {
-	out, err := weka("debug", "traces", "freeze", "show", "-J")
-	if err != nil {
-		return start, end, fmt.Errorf("cannot read freeze period — are you logged in? (weka user login)")
-	}
-	var j struct {
-		Start string `json:"start_time"`
-		End   string `json:"end_time"`
-	}
-	if err := json.Unmarshal([]byte(out), &j); err != nil || j.Start == "" || j.End == "" {
-		return start, end, fmt.Errorf("no freeze period is set on this cluster (weka debug traces freeze show)")
-	}
-	if start, err = time.Parse(time.RFC3339Nano, j.Start); err != nil {
-		return start, end, err
-	}
-	end, err = time.Parse(time.RFC3339Nano, j.End)
-	return start, end, err
-}
-
-func discoverHosts(o opts) []string {
-	if o.hosts != "" {
-		var hs []string
-		for _, h := range strings.Split(o.hosts, ",") {
-			if h = strings.TrimSpace(h); h != "" {
-				hs = append(hs, h)
-			}
-		}
-		return hs
-	}
-	// `weka debug pdsh` resolves hosts from the cluster config. On a cluster
-	// that only just formed (containers still applying resources) the config
-	// dump fails transiently, so retry before giving up — and surface the
-	// CLI's own stderr, which names the real problem.
-	var out string
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		out, err = weka("debug", "pdsh", "--drives", "--print-hosts")
-		if err == nil {
-			break
-		}
-		if attempt < 3 {
-			logf("host discovery attempt %d failed, retrying in 10s...", attempt)
-			time.Sleep(10 * time.Second)
-		}
-	}
-	if err != nil {
-		detail := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			detail = strings.TrimSpace(string(ee.Stderr))
-		}
-		die("host discovery failed: %v %s\n"+
-			"  - is WEKA up on this host? (weka local ps)\n"+
-			"  - a just-formed cluster can take a few minutes before this works\n"+
-			"  - or pass the backends yourself: -hosts host1,host2,...", err, detail)
-	}
-	seen := map[string]bool{}
-	var hs []string
-	for _, line := range strings.Split(out, "\n") {
-		h := strings.TrimSpace(line)
-		if h != "" && !seen[h] {
-			seen[h] = true
-			hs = append(hs, h)
-		}
-	}
-	sort.Strings(hs)
-	return hs
-}
-
-// remoteFilelist runs the selection script on host via ssh+sudo, stdin-fed so
-// no quoting layer can eat it.
-func remoteFilelist(host string, from, to int64) ([]string, error) {
-	args := append(append([]string{}, sshArgs...), host,
-		fmt.Sprintf("sudo bash -s '%d' '%d'", from, to))
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(selectScript)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("listing files on %s: %v", host, err)
-	}
-	var files []string
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if l = strings.TrimSpace(l); l != "" {
-			files = append(files, l)
-		}
-	}
-	return files, nil
-}
-
-func remoteDu(host string, files []string) int64 {
-	if len(files) == 0 {
-		return 0
-	}
-	args := append(append([]string{}, sshArgs...), host,
-		"sudo xargs -r -d '\\n' du -cb 2>/dev/null | tail -1 | cut -f1")
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(strings.Join(files, "\n") + "\n")
-	out, _ := cmd.Output()
-	var n int64
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &n)
-	return n
-}
-
-// streamHostIntoTar pulls `sudo tar` of the file list from host and re-emits
-// every entry into the final tar under hosts/<host>/, renamed from its
-// absolute origin. The remote tar stream frames each file's size, so nothing
-// is staged on disk — the final tarball is the only copy ("tar while
-// saving"; a 2026-10 field run filled a small /tmp with the old two-phase
-// layout's double footprint). Remote tar exit 1 ("file changed as we read
-// it", the open shard; GNU pads the entry to its header size) is expected.
-func streamHostIntoTar(tw *tar.Writer, prefix, host string, files []string) (nfiles int, bytes int64, err error) {
-	args := append(append([]string{}, sshArgs...), host,
-		"sudo tar -cf - --absolute-names --warning=no-file-changed -T -")
-	cmd := exec.Command("ssh", args...)
-	cmd.Stdin = strings.NewReader(strings.Join(files, "\n") + "\n")
-	cmd.Stderr = os.Stderr
-	pipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return 0, 0, err
-	}
-	if err := cmd.Start(); err != nil {
-		return 0, 0, err
-	}
-	tr := tar.NewReader(pipe)
-	for {
-		hdr, rerr := tr.Next()
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return nfiles, bytes, fmt.Errorf("reading tar stream from %s: %v", host, rerr)
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-		name := strings.TrimPrefix(hdr.Name, "/")
-		switch {
-		case strings.HasPrefix(name, "opt/weka/wtracer/traces/"):
-			name = "wtracer/" + strings.TrimPrefix(name, "opt/weka/wtracer/traces/")
-		case strings.HasPrefix(name, "opt/weka/traces/"):
-			name = "traces/" + strings.TrimPrefix(name, "opt/weka/traces/")
-		default:
-			name = "other/" + path.Base(name)
-		}
-		hdr.Name = prefix + "hosts/" + host + "/" + name
-		if werr := tw.WriteHeader(hdr); werr != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return nfiles, bytes, werr
-		}
-		n, werr := io.Copy(tw, tr)
-		bytes += n
-		if werr != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return nfiles, bytes, fmt.Errorf("writing %s: %v", hdr.Name, werr)
-		}
-		nfiles++
-	}
-	if err := cmd.Wait(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return nfiles, bytes, nil // open shard changed mid-read — fine
-		}
-		return nfiles, bytes, fmt.Errorf("remote tar on %s: %v", host, err)
-	}
-	return nfiles, bytes, nil
-}
-
-// addFileToTar copies one local file into the tar at the given entry name.
-func addFileToTar(tw *tar.Writer, localPath, name string) error {
-	fi, err := os.Stat(localPath)
-	if err != nil {
-		return err
-	}
-	f, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: fi.Size(), ModTime: fi.ModTime()}); err != nil {
-		return err
-	}
-	_, err = io.Copy(tw, f)
-	return err
-}
-
-// verifyTarEnd checks the archive's end-of-archive marker (two 512-byte zero
-// blocks). A transfer cut mid-stream leaves a tarball that lists fine until
-// the cut — this catches it at the source, where the size is still knowable.
-func verifyTarEnd(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if fi.Size() < 1024 {
-		return fmt.Errorf("file too small to be a tar archive")
-	}
-	buf := make([]byte, 1024)
-	if _, err := f.ReadAt(buf, fi.Size()-1024); err != nil {
-		return err
-	}
-	for _, b := range buf {
-		if b != 0 {
-			return fmt.Errorf("missing end-of-archive blocks (truncated?)")
-		}
-	}
-	return nil
-}
-
-// addBytesToTar writes an in-memory blob as a tar entry.
-func addBytesToTar(tw *tar.Writer, b []byte, name string) error {
-	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(b)), ModTime: time.Now()}); err != nil {
-		return err
-	}
-	_, err := tw.Write(b)
-	return err
-}
-
-func writeCmdOutput(path string, name string, args ...string) {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil && len(out) == 0 {
-		out = []byte(err.Error())
-	}
-	os.WriteFile(path, out, 0644)
-}
-
-func collectMetadata(metaDir string, o opts, from, to time.Time) {
-	writeCmdOutput(filepath.Join(metaDir, "weka-version.txt"), "weka", "version")
-	writeCmdOutput(filepath.Join(metaDir, "weka-status.json"), "weka", "status", "-J")
-	writeCmdOutput(filepath.Join(metaDir, "cluster-container.json"), "weka", "cluster", "container", "-J")
-	writeCmdOutput(filepath.Join(metaDir, "cluster-process.json"), "weka", "cluster", "process", "-J")
-	writeCmdOutput(filepath.Join(metaDir, "traces-status.txt"), "weka", "debug", "traces", "status")
-	writeCmdOutput(filepath.Join(metaDir, "traces-freeze.txt"), "weka", "debug", "traces", "freeze", "show")
-	win := fmt.Sprintf("start=%s\nend=%s\nmargin_min=%d\nfrom_epoch=%d\nto_epoch=%d\ncollected_at=%s\noffline_traces_uploader_version=%s\n",
-		o.start, o.end, o.marginMin, from.Unix(), to.Unix(), time.Now().UTC().Format(time.RFC3339), version)
-	os.WriteFile(filepath.Join(metaDir, "window.txt"), []byte(win), 0644)
-}
-
-// copyShippedElfCaches pulls /weka/elf_cache/*.cache.zstd out of a running
-// container's rootfs (via /proc/<pid>/root). These let the offline reader
-// decode without the matching weka binaries.
-func copyShippedElfCaches(dstDir string) int {
-	out, err := weka("local", "ps", "--no-header")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 8 || f[1] != "Running" {
-			continue
-		}
-		src := fmt.Sprintf("/proc/%s/root/weka/elf_cache", f[7])
-		entries, err := os.ReadDir(src)
-		if err != nil {
-			continue
-		}
-		n := 0
-		for _, e := range entries {
-			if !strings.HasSuffix(e.Name(), ".cache.zstd") {
-				continue
-			}
-			if b, err := os.ReadFile(filepath.Join(src, e.Name())); err == nil {
-				if os.WriteFile(filepath.Join(dstDir, e.Name()), b, 0644) == nil {
-					n++
-				}
-			}
-		}
-		if n > 0 {
-			return n
-		}
-	}
-	return 0
-}
-
-var errFreezeExists = fmt.Errorf("a freeze period is already set")
-
-func setFreeze(from, to time.Time, days int) error {
-	_, err := weka("debug", "traces", "freeze", "set",
-		"--start-time", from.UTC().Format("2006-01-02 15:04:05")+"Z",
-		"--end-time", to.UTC().Format("2006-01-02 15:04:05")+"Z",
-		"--retention", fmt.Sprintf("%dd", days),
-		"--comment", fmt.Sprintf("offline_traces_uploader %s", time.Now().UTC().Format(time.RFC3339)))
-	if err == nil {
-		return nil
-	}
-	detail := ""
-	if ee, ok := err.(*exec.ExitError); ok {
-		detail = strings.TrimSpace(string(ee.Stderr))
-	}
-	if strings.Contains(detail, "already set") {
-		return errFreezeExists
-	}
-	return fmt.Errorf("%v: %s", err, detail)
-}
-
-// loginInteractively prompts for WEKA cluster credentials on the controlling
-// terminal (password without echo) and runs `weka user login`. Returns true
-// on a successful login; false when there is no terminal or login failed.
-func loginInteractively() bool {
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		return false // no terminal (cron/CI) — keep the old warning path
-	}
-	defer tty.Close()
-	fmt.Fprint(tty, "\nWEKA CLI is not logged in — freeze needs ClusterAdmin.\n")
-	fmt.Fprint(tty, "WEKA username [admin]: ")
-	rd := make([]byte, 256)
-	n, _ := tty.Read(rd)
-	user := strings.TrimSpace(string(rd[:n]))
-	if user == "" {
-		user = "admin"
-	}
-	fmt.Fprint(tty, "WEKA password: ")
-	// no-echo via stty on the same tty; restored right after the read
-	exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
-	n, _ = tty.Read(rd)
-	exec.Command("stty", "-F", "/dev/tty", "echo").Run()
-	fmt.Fprintln(tty)
-	pass := strings.TrimSpace(string(rd[:n]))
-	if pass == "" {
-		return false
-	}
-	if out, err := weka("user", "login", user, pass); err != nil {
-		logf("weka login failed: %v %s", err, out)
-		return false
-	}
-	logf("logged in as %s", user)
-	return true
-}
-
-func clusterName() string {
-	out, err := weka("status", "-J")
-	if err != nil {
+func safeName(s string) string {
+	s = regexp.MustCompile(`[^A-Za-z0-9._-]+`).ReplaceAllString(s, "-")
+	if s == "" {
 		return "cluster"
 	}
-	var j struct {
-		Name string `json:"name"`
-	}
-	if json.Unmarshal([]byte(out), &j) == nil && j.Name != "" {
-		return j.Name
-	}
-	return "cluster"
+	return s
 }
 
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
+func pickPartSize(est int64, minMiB int) int64 {
+	ps := int64(minMiB) << 20
+	// stay well under OCI's 10,000-part ceiling even if the host grows 30%
+	if need := est * 13 / 10 / 9000; need > ps {
+		ps = (need + (1<<20 - 1)) &^ (1<<20 - 1)
 	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
+	if ps > 1<<30 {
+		ps = 1 << 30
 	}
-	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-func upload(o opts, tarPath, cluster string) error {
-	object := fmt.Sprintf("%s/%s_%s.tar", o.customer, time.Now().UTC().Format("2006-01-02_150405"), cluster)
-	url := strings.TrimRight(o.uploadURL, "/") + "/" + object
-	fi, err := os.Stat(tarPath)
-	if err != nil {
-		return err
-	}
-	logf("uploading %s (%s) as: %s", tarPath, humanBytes(fi.Size()), object)
-
-	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		f, err := os.Open(tarPath)
-		if err != nil {
-			return err
-		}
-		req, err := http.NewRequest(http.MethodPut, url, f)
-		if err != nil {
-			f.Close()
-			return err
-		}
-		req.ContentLength = fi.Size()
-		req.Header.Set("Content-Type", "application/x-tar")
-		resp, err := (&http.Client{Timeout: 4 * time.Hour}).Do(req)
-		f.Close()
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				logf("UPLOAD OK: %s", object)
-				logf("local copy kept at %s — delete once WEKA confirms receipt", tarPath)
-				return nil
-			}
-			lastErr = fmt.Errorf("upload got HTTP %d", resp.StatusCode)
-			// 4xx = token expired/invalid/bad path; retrying won't help.
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				break
-			}
-		} else {
-			lastErr = err
-		}
-		logf("upload attempt %d failed: %v", attempt, lastErr)
-		time.Sleep(time.Duration(attempt*5) * time.Second)
-	}
-	return fmt.Errorf("upload failed: %v — tarball is still at %s", lastErr, tarPath)
+	return ps
 }
 
 func main() {
@@ -526,7 +114,7 @@ func main() {
 	flag.StringVar(&o.last, "last", "", "collect the last N of traces ending now, e.g. -last 60m or -last 2h (replaces -start/-end)")
 	flag.BoolVar(&o.fromFreeze, "from-freeze", false, "use the existing freeze period as the window (sets nothing)")
 	flag.BoolVar(&o.estimate, "estimate", false, "print per-host sizes and exit; nothing is copied")
-	flag.StringVar(&o.dest, "dest", "/tmp", "output directory (peak usage ~2x the estimate)")
+	flag.StringVar(&o.dest, "dest", "/tmp", "output directory for the tarball when NOT uploading (needs the full size free)")
 	flag.IntVar(&o.marginMin, "margin-min", 15, "margin in minutes added to each side of the window")
 	flag.StringVar(&o.hosts, "hosts", "", "comma-separated hostnames (overrides discovery)")
 	flag.BoolVar(&o.noFreeze, "no-freeze", false, "do not set a freeze for the window")
@@ -534,19 +122,22 @@ func main() {
 	flag.StringVar(&o.uploadURL, "upload", "", "WEKA-provided upload URL (write-only, expiring)")
 	flag.StringVar(&o.customer, "customer", "", "customer name for the upload folder (required with -upload)")
 	flag.BoolVar(&o.printVersion, "version", false, "print version and exit")
+	flag.IntVar(&o.parallel, "parallel", 3, "hosts uploaded at the same time (with -upload)")
+	flag.IntVar(&o.inflight, "inflight", 3, "upload parts in flight per host (RAM use ~ parallel x (inflight+1) x part size)")
+	flag.IntVar(&o.partMiB, "part-mib", 32, "upload part size in MiB (raised automatically for very large hosts)")
+	flag.DurationVar(&o.stall, "stall", 3*time.Minute, "give up on a host that sends nothing for this long")
+	flag.StringVar(&o.drop, "drop", "", "add to an existing drop (re-collect failed hosts; the summary prints the exact command)")
+	flag.StringVar(&o.uploadFile, "upload-file", "", "upload an already-collected tarball (no cluster or root needed); use with -upload and -customer")
 	flag.Parse()
 
 	if o.printVersion {
 		fmt.Println("offline_traces_uploader", version)
 		return
 	}
-	if _, err := exec.LookPath("weka"); err != nil {
-		die("weka CLI not found — run on a cluster backend")
-	}
-	if os.Geteuid() != 0 {
-		die("run as root (sudo) — host discovery needs it, remote reads use remote sudo")
-	}
-	if o.uploadURL != "" {
+	if o.uploadURL != "" || o.uploadFile != "" {
+		if o.uploadURL == "" {
+			die("-upload-file needs -upload <URL> as well")
+		}
 		if o.customer == "" {
 			die("-upload requires -customer <name>")
 		}
@@ -559,6 +150,74 @@ func main() {
 		}
 	} else if o.customer != "" {
 		die("-customer only makes sense together with -upload")
+	}
+	if o.drop != "" && !dropNameRe.MatchString(o.drop) {
+		die("-drop must be the drop name from the earlier run's summary (letters, digits, . _ -)")
+	}
+	if o.parallel < 1 || o.inflight < 1 || o.partMiB < 8 || o.stall < 10*time.Second {
+		die("-parallel/-inflight must be >= 1, -part-mib >= 8, -stall >= 10s")
+	}
+
+	if o.uploadFile != "" {
+		uploadFile(o)
+		return
+	}
+
+	if _, err := exec.LookPath("weka"); err != nil {
+		die("weka CLI not found — run on a cluster backend")
+	}
+	if os.Geteuid() != 0 {
+		die("run as root (sudo) — host discovery needs it, remote reads use remote sudo")
+	}
+
+	// Connected mode: open the status beacon FIRST, so even a run that dies
+	// at discovery or the freeze is visible to WEKA, with its output.
+	var pc *parClient
+	var dropName, dropPrefix string
+	cluster := ""
+	if !o.estimate {
+		cluster = clusterName() // bounded: weka status may hang on a sick cluster
+	}
+	if o.uploadURL != "" && !o.estimate {
+		var err error
+		if pc, err = newPARClient(o.uploadURL); err != nil {
+			die("%v", err)
+		}
+		dropName = o.drop
+		if dropName == "" {
+			dropName = time.Now().UTC().Format("2006-01-02_150405") + "_" + safeName(cluster)
+		}
+		dropPrefix = o.customer + "/" + dropName + "/"
+		host, _ := os.Hostname()
+		url := o.uploadURL
+		redact := func(s string) string { return strings.ReplaceAll(s, url, "<upload-url>") }
+		b := newBeacon(pc, dropPrefix, progressDoc{
+			Version: version, Customer: o.customer, Cluster: cluster, Drop: dropName,
+			RunsOn: host, Command: strings.Join(os.Args, " "), State: "starting",
+		}, redact)
+		if o.drop != "" {
+			b.object = dropPrefix + "progress-" + time.Now().UTC().Format("150405") + ".json"
+		}
+		// The first write doubles as the upload-code check: an expired code
+		// fails here, before anything is collected.
+		if err := b.flush(60 * time.Second); err != nil {
+			var oe *ociError
+			if errors.As(err, &oe) && oe.status < 500 {
+				die("the upload code was refused — nothing was collected: %v", err)
+			}
+			logf("WARNING: cannot reach WEKA's bucket yet (%v) — continuing, uploads retry on their own", err)
+		}
+		prog = b
+		prog.run(10 * time.Second)
+		logf("WEKA can follow this run live (drop %s)", dropPrefix)
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			s := <-sig
+			logf("interrupted (%v) — stopping; already-finished hosts stay uploaded", s)
+			prog.finish("interrupted", "stopped by the operator")
+			os.Exit(130)
+		}()
 	}
 
 	var startT, endT time.Time
@@ -604,29 +263,57 @@ func main() {
 	}
 	margin := time.Duration(o.marginMin) * time.Minute
 	from, to := startT.Add(-margin), endT.Add(margin)
-	logf("window: %s .. %s (±%dm margin)", from.Format("2006-01-02 15:04:05"), to.Format("2006-01-02 15:04:05"), o.marginMin)
+	logf("window: %s .. %s UTC (±%dm margin)", from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"), o.marginMin)
+	prog.update(func(d *progressDoc) {
+		d.From, d.To = from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339)
+		d.State = "discovering"
+	})
 
 	hosts := discoverHosts(o)
 	if len(hosts) == 0 {
 		die("host discovery came up empty (try -hosts)")
 	}
 	logf("hosts (%d): %s", len(hosts), strings.Join(hosts, " "))
+	for _, h := range hosts {
+		prog.hostDo(h, func(hp *hostProgress) { hp.State = "listing" })
+	}
+	prog.update(func(d *progressDoc) { d.State = "listing" })
 
+	logf("listing + sizing the window on every host...")
+	plans := planHosts(hosts, from.Unix(), to.Unix(), 8)
+	var total int64
+	for _, p := range plans {
+		p := p
+		if p.err != nil {
+			logf("[%s] cannot list: %v", p.name, p.err)
+		} else {
+			if len(p.files) == 0 {
+				logf("[%s] WARNING: no trace files found", p.name)
+			}
+			total += p.est
+		}
+		prog.hostDo(p.name, func(hp *hostProgress) {
+			hp.Files, hp.EstBytes = len(p.files), p.est
+			if p.err != nil {
+				hp.State, hp.Error = "failed", p.err.Error()
+			} else {
+				hp.State = "queued"
+			}
+		})
+	}
 	if o.estimate {
-		var total int64
-		for _, h := range hosts {
-			files, err := remoteFilelist(h, from.Unix(), to.Unix())
-			if err != nil {
-				logf("[%s] %v", h, err)
+		for _, p := range plans {
+			if p.err != nil {
+				fmt.Printf("%-45s %14s  (%v)\n", p.name, "-", p.err)
 				continue
 			}
-			n := remoteDu(h, files)
-			total += n
-			fmt.Printf("%-45s %14d  (%s)\n", h, n, humanBytes(n))
+			fmt.Printf("%-45s %14d  (%s, %d files)\n", p.name, p.est, humanBytes(p.est), len(p.files))
 		}
 		fmt.Printf("%-45s %14d  (%s)\n", "TOTAL", total, humanBytes(total))
 		return
 	}
+	logf("total to collect: %s across %d hosts", humanBytes(total), len(hosts))
+	prog.update(func(d *progressDoc) { d.EstTotal = total })
 
 	if !o.noFreeze {
 		logf("freezing trace window cluster-wide (retention %dd) — needs weka login", o.freezeDays)
@@ -657,27 +344,15 @@ func main() {
 		}
 	}
 
-	cluster := clusterName()
 	stamp := time.Now().Format("20060102-150405")
-	prefix := fmt.Sprintf("weka-traces-%s-%s/", cluster, stamp)
-	out := filepath.Join(o.dest, fmt.Sprintf("weka-traces-%s-%s.tar", cluster, stamp))
+	prefix := fmt.Sprintf("weka-traces-%s-%s/", safeName(cluster), stamp)
 
-	// Everything streams straight into the final tarball — no work dir, so
-	// peak disk usage is the tarball itself (field lesson: the old two-phase
-	// layout needed double the space and filled a small /tmp). Only the tiny
-	// metadata + ELF caches (~55MB) touch a staging dir, briefly.
-	stage, err := os.MkdirTemp(o.dest, ".traces-stage-*")
+	// Metadata + shipped ELF caches (~55MB) — small, staged briefly.
+	stage, err := os.MkdirTemp("", ".traces-stage-*")
 	if err != nil {
-		die("cannot create staging dir in %s: %v", o.dest, err)
+		die("cannot create a staging dir: %v", err)
 	}
 	defer os.RemoveAll(stage)
-
-	f, err := os.Create(out)
-	if err != nil {
-		die("cannot create %s: %v", out, err)
-	}
-	tw := tar.NewWriter(f)
-
 	logf("collecting cluster metadata")
 	metaDir := filepath.Join(stage, "meta")
 	elfDir := filepath.Join(stage, "elf_cache")
@@ -685,42 +360,293 @@ func main() {
 	os.MkdirAll(elfDir, 0755)
 	collectMetadata(metaDir, o, from, to)
 	logf("shipped elf caches: %d files", copyShippedElfCaches(elfDir))
-	for _, d := range []string{"meta", "elf_cache"} {
-		entries, _ := os.ReadDir(filepath.Join(stage, d))
-		for _, e := range entries {
-			if err := addFileToTar(tw, filepath.Join(stage, d, e.Name()), prefix+d+"/"+e.Name()); err != nil {
-				die("writing %s into the tarball: %v", e.Name(), err)
+	writeMeta := func(tw *tar.Writer) {
+		for _, d := range []string{"meta", "elf_cache"} {
+			entries, _ := os.ReadDir(filepath.Join(stage, d))
+			for _, e := range entries {
+				if err := addFileToTar(tw, filepath.Join(stage, d, e.Name()), prefix+d+"/"+e.Name()); err != nil {
+					die("writing %s into the tarball: %v", e.Name(), err)
+				}
 			}
 		}
 	}
 
-	// Hosts stream one after another: a single tar stream can only grow at
-	// one end, and one intra-cluster ssh stream is plenty fast.
-	failed := false
-	for _, h := range hosts {
-		files, err := remoteFilelist(h, from.Unix(), to.Unix())
-		if err != nil {
-			logf("[%s] FAILED: %v", h, err)
-			failed = true
+	if pc != nil {
+		os.Exit(runUpload(o, pc, dropName, dropPrefix, prefix, plans, from, to, writeMeta))
+	}
+	runLocal(o, cluster, stamp, prefix, plans, total, writeMeta)
+}
+
+// runUpload streams every host into its own object, o.parallel at a time.
+// Returns the process exit code: 0 all hosts landed, 3 partial.
+func runUpload(o opts, pc *parClient, dropName, dropPrefix, prefix string, plans []hostPlan,
+	from, to time.Time, writeMeta func(*tar.Writer)) int {
+	prog.update(func(d *progressDoc) { d.State = "collecting" })
+
+	var mb bytes.Buffer
+	mtw := tar.NewWriter(&mb)
+	writeMeta(mtw)
+	mtw.Close()
+	if _, err := pc.uploadStream(context.Background(), dropPrefix+"meta.tar", bytes.NewReader(mb.Bytes()),
+		32<<20, 2, nil); err != nil {
+		die("uploading cluster metadata: %v", err)
+	}
+	logf("metadata uploaded (%s)", humanBytes(int64(mb.Len())))
+
+	var (
+		uploadedAll int64
+		mu          sync.Mutex
+		failed      []string
+		okCount     int
+		okBytes     int64
+	)
+	startAll := time.Now()
+	var estTotal int64
+	for _, p := range plans {
+		if p.err == nil {
+			estTotal += p.est
+		}
+	}
+
+	// Terminal heartbeat every 30s: what's moving and how fast.
+	hbDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-hbDone:
+				return
+			case <-t.C:
+				up := atomic.LoadInt64(&uploadedAll)
+				el := time.Since(startAll).Seconds()
+				rate := float64(up) / el
+				eta := ""
+				if rate > 0 && estTotal > up {
+					eta = fmt.Sprintf(", ETA ~%s", (time.Duration(float64(estTotal-up)/rate) * time.Second).Round(time.Minute))
+				}
+				mu.Lock()
+				done := okCount + len(failed)
+				mu.Unlock()
+				logf("progress: %d/%d hosts finished, %s of ~%s uploaded (%.0f MB/s%s)",
+					done, len(plans), humanBytes(up), humanBytes(estTotal), rate/1e6, eta)
+			}
+		}
+	}()
+
+	jobs := make(chan hostPlan)
+	var wg sync.WaitGroup
+	for w := 0; w < o.parallel; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				n, err := uploadHost(o, pc, dropPrefix, prefix, p, &uploadedAll)
+				mu.Lock()
+				if err != nil {
+					failed = append(failed, p.name)
+				} else {
+					okCount++
+					okBytes += n
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, p := range plans {
+		if p.err != nil {
+			mu.Lock()
+			failed = append(failed, p.name)
+			mu.Unlock()
 			continue
 		}
-		if len(files) == 0 {
-			logf("[%s] WARNING: no shards matched the window", h)
+		jobs <- p
+	}
+	close(jobs)
+	wg.Wait()
+	close(hbDone)
+
+	sort.Strings(failed)
+	el := time.Since(startAll).Round(time.Second)
+	if len(failed) == 0 {
+		logf("UPLOAD OK: all %d hosts, %s in %s — drop %s", okCount, humanBytes(okBytes), el, dropPrefix)
+		logf("WEKA sees it now in the Offline Traces dialog; nothing was written to this host's disk.")
+		prog.finish("done", fmt.Sprintf("all %d hosts uploaded (%s)", okCount, humanBytes(okBytes)))
+		return 0
+	}
+	rerun := fmt.Sprintf("sudo %s -start '%s UTC' -end '%s UTC' -margin-min 0 -no-freeze -drop '%s' -hosts '%s' -customer '%s' -upload '%s'",
+		os.Args[0], from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"),
+		dropName, strings.Join(failed, ","), o.customer, o.uploadURL)
+	logf("PARTIAL: %d of %d hosts uploaded (%s); failed: %s", okCount, len(plans), humanBytes(okBytes), strings.Join(failed, " "))
+	logf("Everything that finished is already with WEKA. To retry ONLY the failed hosts into the same drop:")
+	fmt.Fprintln(os.Stderr, "\n  "+rerun+"\n")
+	prog.update(func(d *progressDoc) { d.Rerun = rerun })
+	prog.finish("partial", fmt.Sprintf("%d of %d hosts uploaded; failed: %s", okCount, len(plans), strings.Join(failed, " ")))
+	return 3
+}
+
+// uploadHost pipes one host's remote tar stream straight into a multipart
+// upload of <drop>/hosts/<host>.tar. Nothing is staged on disk.
+func uploadHost(o opts, pc *parClient, dropPrefix, prefix string, p hostPlan, uploadedAll *int64) (int64, error) {
+	return uploadHostWithPart(o, pc, dropPrefix, prefix, p, uploadedAll, pickPartSize(p.est, o.partMiB))
+}
+
+func uploadHostWithPart(o opts, pc *parClient, dropPrefix, prefix string, p hostPlan, uploadedAll *int64, partSize int64) (int64, error) {
+	h := p.name
+	started := time.Now()
+	prog.hostDo(h, func(hp *hostProgress) {
+		hp.State, hp.Started, hp.Error = "streaming", started.UTC().Format(time.RFC3339), ""
+		hp.ReadBytes, hp.UploadedBytes = 0, 0
+	})
+	logf("[%s] streaming %d files (~%s) to WEKA...", h, len(p.files), humanBytes(p.est))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pr, pw := io.Pipe()
+	var read int64
+	type res struct {
+		n   int
+		sz  int64
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		tw := tar.NewWriter(pw)
+		err := addBytesToTar(tw, []byte(strings.Join(p.files, "\n")+"\n"), prefix+"hosts/"+h+"/filelist.txt")
+		var n int
+		var sz int64
+		if err == nil {
+			n, sz, err = streamHostIntoTar(ctx, tw, prefix, h, p.files, o.stall, &read)
 		}
-		addBytesToTar(tw, []byte(strings.Join(files, "\n")+"\n"), prefix+"hosts/"+h+"/filelist.txt")
-		logf("[%s] streaming %d files...", h, len(files))
-		n, sz, err := streamHostIntoTar(tw, prefix, h, files)
+		if err == nil {
+			err = tw.Close()
+		}
 		if err != nil {
-			logf("[%s] FAILED mid-stream (%d files, %s in): %v", h, n, humanBytes(sz), err)
-			failed = true
+			pw.CloseWithError(fmt.Errorf("collecting from %s: %w", h, err))
+		} else {
+			pw.Close()
+		}
+		done <- res{n, sz, err}
+	}()
+
+	// Mirror read progress into the beacon while it runs.
+	pdone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pdone:
+				return
+			case <-t.C:
+				r := atomic.LoadInt64(&read)
+				prog.hostDo(h, func(hp *hostProgress) { hp.ReadBytes = r })
+			}
+		}
+	}()
+
+	var up int64
+	_, uerr := pc.uploadStream(ctx, dropPrefix+"hosts/"+h+".tar", pr,
+		partSize, o.inflight, func(n int64) {
+			atomic.AddInt64(&up, n)
+			atomic.AddInt64(uploadedAll, n)
+			v := atomic.LoadInt64(&up)
+			prog.hostDo(h, func(hp *hostProgress) { hp.UploadedBytes = v })
+		})
+	if uerr != nil {
+		cancel() // stop the remote tar
+	}
+	pr.CloseWithError(errors.New("upload stopped"))
+	r := <-done
+	close(pdone)
+
+	el := time.Since(started)
+	finished := time.Now().UTC().Format(time.RFC3339)
+	// Which side failed first decides the message: a stalled host, else the
+	// upload's own error (which already carries a collection error that
+	// ended the stream), else the collection error.
+	var ferr error
+	state := "failed"
+	switch {
+	case r.err != nil && errors.Is(r.err, errStalled):
+		ferr, state = r.err, "stalled"
+	case uerr != nil:
+		ferr = uerr
+	case r.err != nil:
+		ferr = r.err
+	}
+	if ferr != nil {
+		logf("[%s] FAILED: %v", h, ferr)
+		prog.hostDo(h, func(hp *hostProgress) { hp.State, hp.Error, hp.Finished = state, oneLine(ferr.Error()), finished })
+		return 0, ferr
+	}
+	u := atomic.LoadInt64(&up)
+	logf("[%s] done: %d files, %s in %s (%.0f MB/s)", h, r.n, humanBytes(u), el.Round(time.Second), float64(u)/el.Seconds()/1e6)
+	prog.hostDo(h, func(hp *hostProgress) {
+		hp.State, hp.Finished, hp.ReadBytes, hp.UploadedBytes = "done", finished, atomic.LoadInt64(&read), u
+	})
+	return u, nil
+}
+
+// runLocal (dark site): one tarball in -dest. Refuses to start when it would
+// not fit, or when -dest is on a WEKA filesystem (in an incident, writes
+// there can hang) — instead of filling a production backend's disk halfway.
+func runLocal(o opts, cluster, stamp, prefix string, plans []hostPlan, total int64, writeMeta func(*tar.Writer)) {
+	if err := os.MkdirAll(o.dest, 0755); err != nil {
+		die("cannot use -dest %s: %v", o.dest, err)
+	}
+	if mnt, fst := mountOf(o.dest); fst == "wekafs" {
+		die("-dest %s is on a WEKA filesystem (%s). During an incident writes there can hang —\n"+
+			"  point -dest at a local disk with %s free.", o.dest, mnt, humanBytes(total))
+	}
+	need := total + 128<<20
+	avail, size, err := freeSpace(o.dest)
+	if err == nil {
+		reserve := size / 10 // never take the filesystem past 90%
+		if reserve < 2<<30 {
+			reserve = 2 << 30
+		}
+		if avail-need < reserve {
+			die("-dest %s has %s free; this collection needs %s and must leave %s spare.\n"+
+				"  Options: -dest <a bigger local disk>, -hosts <fewer hosts>, a smaller -margin-min,\n"+
+				"  or upload directly with -upload (writes nothing locally). Per-host sizes: run with -estimate.",
+				o.dest, humanBytes(avail), humanBytes(need), humanBytes(reserve))
+		}
+	}
+
+	out := filepath.Join(o.dest, fmt.Sprintf("weka-traces-%s-%s.tar", safeName(cluster), stamp))
+	f, err := os.Create(out)
+	if err != nil {
+		die("cannot create %s: %v", out, err)
+	}
+	tw := tar.NewWriter(f)
+	writeMeta(tw)
+
+	// Hosts stream one after another: a single tar stream can only grow at
+	// one end, and one intra-cluster ssh stream is plenty fast.
+	var failed []string
+	for _, p := range plans {
+		h := p.name
+		if p.err != nil {
+			failed = append(failed, h)
+			continue
+		}
+		addBytesToTar(tw, []byte(strings.Join(p.files, "\n")+"\n"), prefix+"hosts/"+h+"/filelist.txt")
+		logf("[%s] streaming %d files (~%s)...", h, len(p.files), humanBytes(p.est))
+		n, sz, err := streamHostIntoTar(context.Background(), tw, prefix, h, p.files, o.stall, nil)
+		if err != nil {
+			logf("[%s] FAILED (%d files, %s in): %v", h, n, humanBytes(sz), err)
+			failed = append(failed, h)
+			if !errors.Is(err, errStalled) && strings.Contains(err.Error(), "writing ") {
+				// a local write error (disk full) poisons the archive — stop
+				tw.Close()
+				f.Close()
+				die("cannot keep writing %s: %v", out, err)
+			}
 			continue
 		}
 		logf("[%s] %d files, %s", h, n, humanBytes(sz))
 	}
-	if failed {
-		logf("WARNING: one or more hosts failed — check output above")
-	}
-
 	if err := tw.Close(); err != nil {
 		die("finalizing tarball: %v", err)
 	}
@@ -732,14 +658,66 @@ func main() {
 		die("the tarball failed its end-of-archive check (%v) — do not ship it", err)
 	}
 	logf("DONE: %s (%s, %d bytes)", out, humanBytes(fi.Size()), fi.Size())
+	if len(failed) > 0 {
+		sort.Strings(failed)
+		logf("WARNING: these hosts are NOT in the tarball: %s (rerun with -hosts for them)", strings.Join(failed, ","))
+	}
 	logf("verified: archive ends cleanly. CONFIRM THE BYTE COUNT after every copy hop —")
 	logf("a cut transfer leaves a tarball that looks fine until extraction (field lesson).")
+	logf("To send it to WEKA from any Linux box with internet:")
+	logf("  ./offline_traces_uploader -upload-file %s -customer <name> -upload '<URL from WEKA>'", filepath.Base(out))
+}
 
-	if o.uploadURL != "" {
-		if err := upload(o, out, cluster); err != nil {
-			die("%v", err)
-		}
-	} else {
-		logf("Ship this single file — per-host shards + ELF caches + cluster metadata.")
+// uploadFile pushes an existing tarball (dark-site carry-out, or a v0.1.x
+// leftover) in parallel parts. No cluster, no root.
+func uploadFile(o opts) {
+	fi, err := os.Stat(o.uploadFile)
+	if err != nil {
+		die("%v", err)
 	}
+	if err := verifyTarEnd(o.uploadFile); err != nil {
+		die("%s is not a complete tarball (%v) — copy it again and compare the byte count", o.uploadFile, err)
+	}
+	pc, err := newPARClient(o.uploadURL)
+	if err != nil {
+		die("%v", err)
+	}
+	base := safeName(strings.TrimSuffix(filepath.Base(o.uploadFile), ".tar")) + ".tar"
+	object := fmt.Sprintf("%s/%s_%s", o.customer, time.Now().UTC().Format("2006-01-02_150405"), base)
+	f, err := os.Open(o.uploadFile)
+	if err != nil {
+		die("%v", err)
+	}
+	defer f.Close()
+	logf("uploading %s (%s) as %s", o.uploadFile, humanBytes(fi.Size()), object)
+	var up int64
+	start := time.Now()
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				u := atomic.LoadInt64(&up)
+				rate := float64(u) / time.Since(start).Seconds()
+				eta := ""
+				if rate > 0 {
+					eta = fmt.Sprintf(", ETA ~%s", (time.Duration(float64(fi.Size()-u)/rate) * time.Second).Round(time.Second))
+				}
+				logf("  %s / %s (%.0f%%, %.1f MB/s%s)", humanBytes(u), humanBytes(fi.Size()),
+					float64(u)*100/float64(fi.Size()), rate/1e6, eta)
+			}
+		}
+	}()
+	_, err = pc.uploadStream(context.Background(), object, f, pickPartSize(fi.Size(), o.partMiB), 4,
+		func(n int64) { atomic.AddInt64(&up, n) })
+	close(stop)
+	if err != nil {
+		die("upload failed: %v — the file is untouched, just run the same command again", err)
+	}
+	logf("UPLOAD OK: %s (%s in %s) — WEKA sees it in the Offline Traces dialog now",
+		object, humanBytes(fi.Size()), time.Since(start).Round(time.Second))
 }
